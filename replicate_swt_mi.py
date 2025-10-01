@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
 Fixed: Sharma & Sunkaria (2018) - SWT + features + KNN/SVM on PTB-DB.
+Optimized for speed with parallel processing and fast entropy approximation.
 """
 
 import math
 import os
 from collections import Counter
+from functools import partial
+from multiprocessing import Pool, cpu_count
 
 import numpy as np
 import pandas as pd
@@ -33,6 +36,7 @@ SAMP_ENT_R_FACTOR = 0.2
 N_GAIN_BINS = 10
 TOP_K_FEATURES = 10
 EPS = 1e-12
+N_JOBS = max(1, cpu_count() - 1)  # Use all but one CPU core
 
 
 def get_subject_id(record_name):
@@ -59,13 +63,14 @@ def preprocess_signal(sig, fs=TARGET_FS):
 
 
 def sample_entropy_fast(x, m=SAMP_ENT_M, r_factor=SAMP_ENT_R_FACTOR):
-    """Optimized sample entropy - trades some accuracy for massive speed gain"""
+    """Ultra-fast approximate sample entropy"""
     x = np.asarray(x, dtype=np.float64)
     N = len(x)
 
-    # For very long signals, downsample for SampEn calculation only
-    if N > 200:
-        step = N // 200
+    # Aggressively downsample for entropy calculation
+    # Entropy measures complexity, which is preserved even with fewer samples
+    if N > 100:
+        step = max(1, N // 100)
         x = x[::step]
         N = len(x)
 
@@ -73,25 +78,38 @@ def sample_entropy_fast(x, m=SAMP_ENT_M, r_factor=SAMP_ENT_R_FACTOR):
     if r == 0 or N < m + 2:
         return 0.0
 
-    # Simplified counting using numpy operations
+    # Only sample a subset of comparisons for speed
+    max_comparisons = min(500, (N - m) * (N - m - 1) // 2)
+
     B_count = 0
     A_count = 0
+    comparisons_done = 0
 
-    for i in range(N - m):
-        # Get template of length m
+    # Stratified sampling: sample uniformly across the signal
+    i_step = max(1, (N - m) // 20)  # Sample ~20 starting points
+
+    for i in range(0, N - m, i_step):
         template_m = x[i:i + m]
 
-        # Compare with all subsequent templates (upper triangle only)
-        for j in range(i + 1, N - m + 1):
+        # Compare with sampled subsequent templates
+        j_step = max(1, (N - m - i) // 10)  # Sample ~10 comparisons per i
+        for j in range(i + 1, N - m + 1, j_step):
+            if comparisons_done >= max_comparisons:
+                break
+
             dist_m = np.max(np.abs(template_m - x[j:j + m]))
             if dist_m <= r:
                 B_count += 1
 
-                # Check m+1 length
                 if i < N - m - 1 and j < N - m:
                     dist_m1 = np.max(np.abs(x[i:i + m + 1] - x[j:j + m + 1]))
                     if dist_m1 <= r:
                         A_count += 1
+
+            comparisons_done += 1
+
+        if comparisons_done >= max_comparisons:
+            break
 
     if B_count == 0:
         return 0.0
@@ -155,7 +173,51 @@ def extract_features_from_coeffs(coeff, fs=TARGET_FS):
     }
 
 
-def build_dataset(records, data_dir=DATA_DIR, leads=None):
+def process_single_segment(args):
+    """Process a single segment - designed for parallel processing"""
+    seg_data, leads = args
+    features = {}
+
+    for li, lead in enumerate(leads):
+        seg = seg_data[li]
+
+        # SWT decomposition for seg and seg^2
+        for power_label, seg_power in [("", seg), ("_z2", seg ** 2)]:
+            try:
+                coeffs = pywt.swt(seg_power, WAVELET, level=SWT_LEVELS)
+            except:
+                continue
+
+            # Calculate total energy
+            total_e = sum(np.sum(d ** 2) for a, d in coeffs)
+            total_e += np.sum(coeffs[-1][0] ** 2)
+            if total_e == 0:
+                total_e = 1.0
+
+            # Extract features from detail coefficients
+            for lvl, (a, d) in enumerate(coeffs, start=1):
+                feats = extract_features_from_coeffs(d, TARGET_FS)
+                for fname, fval in feats.items():
+                    key = f"{lead}_D{lvl}_{fname}{power_label}"
+                    if fname == 'NSE':
+                        features[key] = fval / total_e
+                    else:
+                        features[key] = fval
+
+            # Approximation coefficients
+            a_final = coeffs[-1][0]
+            feats = extract_features_from_coeffs(a_final, TARGET_FS)
+            for fname, fval in feats.items():
+                key = f"{lead}_A{SWT_LEVELS}_{fname}{power_label}"
+                if fname == 'NSE':
+                    features[key] = fval / total_e
+                else:
+                    features[key] = fval
+
+    return features
+
+
+def build_dataset(records, data_dir=DATA_DIR, leads=None, use_parallel=True):
     if leads is None:
         leads = LEADS
 
@@ -197,7 +259,7 @@ def build_dataset(records, data_dir=DATA_DIR, leads=None):
         # Load signals
         try:
             lead_sigs, orig_fs = load_record_signal(rec, data_dir, leads)
-        except Exception as e:
+        except Exception:
             records_skipped += 1
             pbar.set_postfix({'processed': records_processed, 'skipped': records_skipped,
                               'segments': segments_extracted})
@@ -210,7 +272,7 @@ def build_dataset(records, data_dir=DATA_DIR, leads=None):
                               'segments': segments_extracted})
             continue
 
-        # Process each lead
+        # Process each lead - preprocessing
         per_lead_segments = []
         for sig in lead_sigs:
             ds = downsample_signal(sig, orig_fs, TARGET_FS)
@@ -230,47 +292,22 @@ def build_dataset(records, data_dir=DATA_DIR, leads=None):
                               'segments': segments_extracted})
             continue
 
-        # Process segments
+        # Prepare segment data for parallel processing
         nseg = min(len(s) for s in per_lead_segments)
+        segment_args = []
         for si in range(nseg):
-            features = {}
+            seg_data = [per_lead_segments[li][si] for li in range(len(leads))]
+            segment_args.append((seg_data, leads))
 
-            for li, lead in enumerate(leads):
-                seg = per_lead_segments[li][si]
+        # Process segments (parallel or sequential)
+        if use_parallel and len(segment_args) > 4:
+            with Pool(processes=min(N_JOBS, len(segment_args))) as pool:
+                segment_features = pool.map(process_single_segment, segment_args)
+        else:
+            segment_features = [process_single_segment(arg) for arg in segment_args]
 
-                # SWT decomposition for seg and seg^2
-                for power_label, seg_power in [("", seg), ("_z2", seg ** 2)]:
-                    try:
-                        coeffs = pywt.swt(seg_power, WAVELET, level=SWT_LEVELS)
-                    except:
-                        continue
-
-                    # Calculate total energy
-                    total_e = sum(np.sum(d ** 2) for a, d in coeffs)
-                    total_e += np.sum(coeffs[-1][0] ** 2)
-                    if total_e == 0:
-                        total_e = 1.0
-
-                    # Extract features from detail coefficients
-                    for lvl, (a, d) in enumerate(coeffs, start=1):
-                        feats = extract_features_from_coeffs(d, TARGET_FS)
-                        for fname, fval in feats.items():
-                            key = f"{lead}_D{lvl}_{fname}{power_label}"
-                            if fname == 'NSE':
-                                features[key] = fval / total_e
-                            else:
-                                features[key] = fval
-
-                    # Approximation coefficients
-                    a_final = coeffs[-1][0]
-                    feats = extract_features_from_coeffs(a_final, TARGET_FS)
-                    for fname, fval in feats.items():
-                        key = f"{lead}_A{SWT_LEVELS}_{fname}{power_label}"
-                        if fname == 'NSE':
-                            features[key] = fval / total_e
-                        else:
-                            features[key] = fval
-
+        # Collect results
+        for features in segment_features:
             if features:
                 rows.append(features)
                 labels_out.append(1 if label == "IMI" else 0)
@@ -422,18 +459,273 @@ def diagnose_records(data_dir, labels_file, num_samples=5):
     print("\n" + "=" * 60)
 
 
+def save_and_visualize_results(X, y, topk, scores, results, output_base="results"):
+    """Save and visualize all results with timestamp-based organization"""
+    from datetime import datetime
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    # Create timestamped subdirectory
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = os.path.join(output_base, f"run_{timestamp}")
+    os.makedirs(output_dir, exist_ok=True)
+
+    print(f"\nSaving results to: {output_dir}/")
+
+    # 1. Save top-k features CSV
+    X[topk].to_csv(os.path.join(output_dir, "features_topk.csv"), index=False)
+
+    # 2. Save gain ratio scores
+    gain_df = pd.DataFrame({
+        "feature": list(scores.keys()),
+        "gainratio": list(scores.values())
+    }).sort_values("gainratio", ascending=False)
+    gain_df.to_csv(os.path.join(output_dir, "gainratio_scores.csv"), index=False)
+
+    # 3. Save classification results
+    results_df = pd.DataFrame([results])
+    results_df.to_csv(os.path.join(output_dir, "classification_results.csv"), index=False)
+
+    # === VISUALIZATIONS ===
+    sns.set_style("whitegrid")
+    plt.rcParams['figure.dpi'] = 100
+
+    # 4. Top 10 Features Bar Chart
+    fig, ax = plt.subplots(figsize=(10, 6))
+    top10_df = gain_df.head(10).sort_values("gainratio", ascending=True)
+    colors = plt.cm.viridis(np.linspace(0.3, 0.9, len(top10_df)))
+    ax.barh(range(len(top10_df)), top10_df['gainratio'], color=colors)
+    ax.set_yticks(range(len(top10_df)))
+    ax.set_yticklabels(top10_df['feature'], fontsize=9)
+    ax.set_xlabel('Gain Ratio', fontsize=11, fontweight='bold')
+    ax.set_title('Top 10 Features by Gain Ratio', fontsize=13, fontweight='bold')
+    ax.grid(axis='x', alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "top10_features.png"), bbox_inches='tight')
+    plt.close()
+
+    # 5. Classification Metrics Bar Chart
+    fig, ax = plt.subplots(figsize=(10, 6))
+    metrics_names = ['AUC', 'Accuracy', 'Sensitivity', 'Specificity', 'Precision']
+    metrics_values = [
+        results['auc'],
+        results['acc'],
+        results['sen'],
+        results['spec'],
+        results['prec']
+    ]
+    colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A', '#98D8C8']
+    bars = ax.bar(metrics_names, metrics_values, color=colors, alpha=0.8, edgecolor='black', linewidth=1.5)
+
+    # Add value labels on bars
+    for bar, val in zip(bars, metrics_values):
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width() / 2., height,
+                f'{val:.4f}\n({val * 100:.2f}%)', ha='center', va='bottom', fontsize=10, fontweight='bold')
+
+    ax.set_ylabel('Score', fontsize=11, fontweight='bold')
+    ax.set_title('Classification Performance Metrics (10-Fold CV)', fontsize=13, fontweight='bold')
+    ax.set_ylim(0, 1.1)
+    ax.grid(axis='y', alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "classification_metrics.png"), bbox_inches='tight')
+    plt.close()
+
+    # 6. Feature Distribution Analysis (Top 3 features)
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    for idx, feat in enumerate(topk[:3]):
+        ax = axes[idx]
+        hc_data = X.loc[y == 0, feat]
+        imi_data = X.loc[y == 1, feat]
+
+        ax.hist(hc_data, bins=30, alpha=0.6, label='HC', color='blue', edgecolor='black')
+        ax.hist(imi_data, bins=30, alpha=0.6, label='IMI', color='red', edgecolor='black')
+        ax.set_xlabel('Feature Value', fontsize=10)
+        ax.set_ylabel('Frequency', fontsize=10)
+        ax.set_title(f'{feat}\n(Gain Ratio: {scores[feat]:.4f})', fontsize=10, fontweight='bold')
+        ax.legend()
+        ax.grid(alpha=0.3)
+
+    plt.suptitle('Distribution of Top 3 Features', fontsize=14, fontweight='bold', y=1.02)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "top3_distributions.png"), bbox_inches='tight')
+    plt.close()
+
+    # 7. Gain Ratio Scores - Full Distribution
+    fig, ax = plt.subplots(figsize=(12, 6))
+    top30 = gain_df.head(30)
+    ax.plot(range(len(top30)), top30['gainratio'], marker='o', linewidth=2, markersize=6, color='#2E86AB')
+    ax.fill_between(range(len(top30)), top30['gainratio'], alpha=0.3, color='#2E86AB')
+    ax.axvline(x=9.5, color='red', linestyle='--', linewidth=2, label='Top 10 cutoff')
+    ax.set_xlabel('Feature Rank', fontsize=11, fontweight='bold')
+    ax.set_ylabel('Gain Ratio', fontsize=11, fontweight='bold')
+    ax.set_title('Gain Ratio Distribution (Top 30 Features)', fontsize=13, fontweight='bold')
+    ax.legend()
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "gainratio_distribution.png"), bbox_inches='tight')
+    plt.close()
+
+    # 8. Summary Text Report
+    with open(os.path.join(output_dir, "summary_report.txt"), 'w') as f:
+        f.write("=" * 70 + "\n")
+        f.write("MYOCARDIAL INFARCTION DETECTION - RESULTS SUMMARY\n")
+        f.write("=" * 70 + "\n\n")
+        f.write(f"Timestamp: {timestamp}\n")
+        f.write(f"Dataset Size: {len(X)} segments\n")
+        f.write(f"HC samples: {np.sum(y == 0)}\n")
+        f.write(f"IMI samples: {np.sum(y == 1)}\n\n")
+
+        f.write("-" * 70 + "\n")
+        f.write("TOP 10 FEATURES (by Gain Ratio)\n")
+        f.write("-" * 70 + "\n")
+        for i, (feat, score) in enumerate(gain_df.head(10).values, 1):
+            f.write(f"{i:2d}. {feat:40s} : {score:.6f}\n")
+
+        f.write("\n" + "-" * 70 + "\n")
+        f.write("CLASSIFICATION RESULTS (10-Fold Cross-Validation with KNN, K=3)\n")
+        f.write("-" * 70 + "\n")
+        f.write(f"AUC (ROC):        {results['auc']:.4f}\n")
+        f.write(f"Accuracy:         {results['acc']:.4f} ({results['acc'] * 100:.2f}%)\n")
+        f.write(f"Sensitivity:      {results['sen']:.4f} ({results['sen'] * 100:.2f}%)\n")
+        f.write(f"Specificity:      {results['spec']:.4f} ({results['spec'] * 100:.2f}%)\n")
+        f.write(f"Precision:        {results['prec']:.4f} ({results['prec'] * 100:.2f}%)\n")
+
+        f.write("\n" + "=" * 70 + "\n")
+        f.write("Paper Reference: Sharma & Sunkaria (2018)\n")
+        f.write("Paper Results (Class-oriented with KNN):\n")
+        f.write("  ROC=0.9945, Se%=98.67, Sp%=98.72, +P%=98.79, Ac%=98.69\n")
+        f.write("=" * 70 + "\n")
+
+    # 9. HTML Dashboard
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>MI Detection Results - {timestamp}</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }}
+            .container {{ max-width: 1200px; margin: auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+            h1 {{ color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }}
+            h2 {{ color: #34495e; margin-top: 30px; }}
+            .metrics {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin: 20px 0; }}
+            .metric-card {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; border-radius: 8px; text-align: center; }}
+            .metric-value {{ font-size: 32px; font-weight: bold; }}
+            .metric-label {{ font-size: 14px; margin-top: 5px; opacity: 0.9; }}
+            table {{ width: 100%; border-collapse: collapse; margin: 20px 0; }}
+            th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }}
+            th {{ background-color: #3498db; color: white; }}
+            tr:hover {{ background-color: #f5f5f5; }}
+            img {{ max-width: 100%; height: auto; margin: 20px 0; border: 1px solid #ddd; border-radius: 5px; }}
+            .info-box {{ background: #e8f4f8; padding: 15px; border-left: 4px solid #3498db; margin: 20px 0; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Myocardial Infarction Detection Results</h1>
+            <p><strong>Generated:</strong> {timestamp}</p>
+
+            <div class="info-box">
+                <strong>Dataset Information:</strong><br>
+                Total Segments: {len(X)} | HC: {np.sum(y == 0)} | IMI: {np.sum(y == 1)}
+            </div>
+
+            <h2>Performance Metrics (10-Fold Cross-Validation)</h2>
+            <div class="metrics">
+                <div class="metric-card">
+                    <div class="metric-value">{results['auc']:.4f}</div>
+                    <div class="metric-label">AUC (ROC)</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value">{results['acc'] * 100:.2f}%</div>
+                    <div class="metric-label">Accuracy</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value">{results['sen'] * 100:.2f}%</div>
+                    <div class="metric-label">Sensitivity</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value">{results['spec'] * 100:.2f}%</div>
+                    <div class="metric-label">Specificity</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value">{results['prec'] * 100:.2f}%</div>
+                    <div class="metric-label">Precision</div>
+                </div>
+            </div>
+
+            <img src="classification_metrics.png" alt="Classification Metrics">
+
+            <h2>Top 10 Selected Features</h2>
+            <table>
+                <tr>
+                    <th>Rank</th>
+                    <th>Feature</th>
+                    <th>Gain Ratio</th>
+                </tr>
+    """
+
+    for i, (feat, score) in enumerate(gain_df.head(10).values, 1):
+        html_content += f"""
+                <tr>
+                    <td>{i}</td>
+                    <td>{feat}</td>
+                    <td>{score:.6f}</td>
+                </tr>
+        """
+
+    html_content += f"""
+            </table>
+
+            <img src="top10_features.png" alt="Top 10 Features">
+            <img src="gainratio_distribution.png" alt="Gain Ratio Distribution">
+
+            <h2>Feature Distributions</h2>
+            <img src="top3_distributions.png" alt="Top 3 Feature Distributions">
+
+            <h2>Reference</h2>
+            <div class="info-box">
+                <strong>Paper:</strong> Sharma & Sunkaria (2018) - Inferior myocardial infarction detection using stationary wavelet transform and machine learning approach<br>
+                <strong>Paper Results (Class-oriented KNN):</strong> ROC=0.9945, Se%=98.67, Sp%=98.72, +P%=98.79, Ac%=98.69
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+    with open(os.path.join(output_dir, "dashboard.html"), 'w') as f:
+        f.write(html_content)
+
+    print(f"\n{'=' * 70}")
+    print("RESULTS SAVED SUCCESSFULLY")
+    print(f"{'=' * 70}")
+    print(f"Location: {output_dir}/")
+    print(f"\nGenerated files:")
+    print(f"  - features_topk.csv          (Top {len(topk)} feature values)")
+    print(f"  - gainratio_scores.csv       (All feature scores)")
+    print(f"  - classification_results.csv (Performance metrics)")
+    print(f"  - summary_report.txt         (Text summary)")
+    print(f"  - dashboard.html             (Interactive HTML report)")
+    print(f"  - *.png                      (Visualization charts)")
+    print(f"\nOpen dashboard.html in your browser for an interactive view!")
+    print(f"{'=' * 70}\n")
+
+    return output_dir
+
+
 def main():
     labels_file = os.path.join(DATA_DIR, "PTB_LABELS.csv")
 
     # Run diagnostics first
     if os.path.exists(labels_file):
-        diagnose_records(DATA_DIR, labels_file, num_samples=10)
+        print("\nRunning diagnostics...")
+        diagnose_records(DATA_DIR, labels_file, num_samples=5)
     else:
         print(f"ERROR: {labels_file} not found!")
         return
 
     # Ask user to continue
-    print("\nDo you want to continue with full processing? (This may take a while)")
+    print("\nDo you want to continue with full processing?")
     response = input("Continue? (yes/no): ").strip().lower()
     if response not in ['yes', 'y']:
         print("Stopping. Please check the diagnostic output above.")
@@ -442,8 +734,9 @@ def main():
     # Load records
     records = pd.read_csv(labels_file)['record'].tolist()
     print(f"\n\nProcessing {len(records)} records...")
+    print(f"Using {N_JOBS} CPU cores for parallel processing\n")
 
-    X, y, subjects = build_dataset(records, DATA_DIR, LEADS)
+    X, y, subjects = build_dataset(records, DATA_DIR, LEADS, use_parallel=True)
 
     if X.empty or len(y) == 0:
         print("\nERROR: No data was extracted!")
@@ -459,36 +752,49 @@ def main():
     print(f"  Unique subjects: {len(np.unique(subjects))}")
 
     # Clean data
+    print("\nCleaning data...")
     X = X.replace([np.inf, -np.inf], np.nan).fillna(0)
     X = X.loc[:, X.nunique(dropna=False) > 1]
     print(f"  After cleaning: {X.shape}")
 
     # Feature selection
-    print("\n\nSelecting features...")
+    print("\n\nSelecting features (this may take a few minutes)...")
     topk, scores = select_top_k_features(X, y, TOP_K_FEATURES)
-    print(f"Top {TOP_K_FEATURES} features:")
+    print(f"\nTop {TOP_K_FEATURES} features:")
     for i, feat in enumerate(topk, 1):
-        print(f"  {i}. {feat}: {scores[feat]:.4f}")
+        print(f"  {i:2d}. {feat:40s} : {scores[feat]:.6f}")
 
     # Evaluation
-    print("\n\nEvaluating model...")
+    print("\n\nEvaluating model (10-fold cross-validation)...")
     results = evaluate_class_oriented(X, y, topk)
-    print(f"\nClass-oriented results (10-fold CV with KNN, K=3):")
+    print(f"\nClass-oriented results (KNN, K=3):")
     print(f"  AUC:         {results['auc']:.4f}")
     print(f"  Accuracy:    {results['acc'] * 100:.2f}%")
     print(f"  Sensitivity: {results['sen'] * 100:.2f}%")
     print(f"  Specificity: {results['spec'] * 100:.2f}%")
     print(f"  Precision:   {results['prec'] * 100:.2f}%")
 
-    # Save results
-    output_dir = "results"
-    os.makedirs(output_dir, exist_ok=True)
-    X[topk].to_csv(os.path.join(output_dir, "features_topk.csv"), index=False)
-    pd.DataFrame({"feature": list(scores.keys()), "gainratio": list(scores.values())}) \
-        .sort_values("gainratio", ascending=False) \
-        .to_csv(os.path.join(output_dir, "gainratio_scores.csv"), index=False)
+    # Save and visualize results
+    print("\n\nGenerating visualizations and saving results...")
+    output_dir = save_and_visualize_results(X, y, topk, scores, results)
 
-    print(f"\n✓ Results saved to {output_dir}/")
+    # Final comparison with paper
+    print("\n" + "=" * 70)
+    print("COMPARISON WITH PAPER RESULTS")
+    print("=" * 70)
+    print("\nPaper (Sharma & Sunkaria 2018) - Class-oriented KNN (K=3):")
+    print("  ROC:         0.9945")
+    print("  Sensitivity: 98.67%")
+    print("  Specificity: 98.72%")
+    print("  Precision:   98.79%")
+    print("  Accuracy:    98.69%")
+    print("\nYour Replication:")
+    print(f"  AUC:         {results['auc']:.4f}")
+    print(f"  Sensitivity: {results['sen'] * 100:.2f}%")
+    print(f"  Specificity: {results['spec'] * 100:.2f}%")
+    print(f"  Precision:   {results['prec'] * 100:.2f}%")
+    print(f"  Accuracy:    {results['acc'] * 100:.2f}%")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
